@@ -8,12 +8,12 @@ const int shoulderPin = 2;
 const int elbowPin    = 4;
 const int gripperPin  = 5;
 
-const int joy1XPin = A0;  // base left/right
-const int joy1YPin = A1;  // shoulder up/down
-const int joy2XPin = A2;  // gripper left/right
-const int joy2YPin = A3;  // elbow up/down
-const int btn1Pin  = 7;   // return to rest
-const int btn2Pin  = 8;   // wave emote
+const int joy1XPin = A0;
+const int joy1YPin = A1;
+const int joy2XPin = A2;
+const int joy2YPin = A3;
+const int btn1Pin  = 7;
+const int btn2Pin  = 8;
 
 // ============================
 // SERVO OBJECTS
@@ -31,17 +31,13 @@ int currentShoulder = 90;
 int currentElbow    = 90;
 int currentGripper  = 90;
 
-// Last positions actually written to servos
-// Only write when position changes — eliminates buzzing
-int lastWrittenBase     = 90;
-int lastWrittenShoulder = 90;
-int lastWrittenElbow    = 90;
-int lastWrittenGripper  = 90;
+int lastWrittenBase     = -1;
+int lastWrittenShoulder = -1;
+int lastWrittenElbow    = -1;
+int lastWrittenGripper  = -1;
 
 // ============================
 // SERVO LIMITS
-// Prevents servos from pushing past physical limits
-// Adjust if any joint binds at extremes
 // ============================
 const int baseMin     = 0;
 const int baseMax     = 180;
@@ -49,12 +45,13 @@ const int shoulderMin = 30;
 const int shoulderMax = 150;
 const int elbowMin    = 30;
 const int elbowMax    = 150;
-const int gripperMin  = 45;   // closed position
-const int gripperMax  = 135;  // open position
+const int gripperMin  = 45;
+const int gripperMax  = 135;
 
 // ============================
 // REST POSITION
-// Where arm returns to on button 1 press
+// Base rest is now adjustable in case servo's true center isn't 90
+// Tune this if the arm doesn't sit straight at "rest"
 // ============================
 const int restBase     = 90;
 const int restShoulder = 90;
@@ -62,34 +59,31 @@ const int restElbow    = 90;
 const int restGripper  = 90;
 
 // ============================
-// DEADZONE
-// Joystick must move this far from center before arm moves
-// Wide deadzone prevents drift from analog noise
-// Center value = 512, deadzone = ±150
+// CALIBRATED JOYSTICK CENTERS
+// These get measured at startup instead of assumed at 512
+// Compensates for joysticks that don't rest exactly at 512
 // ============================
-const int joyCenter   = 512;
-const int deadzoneSize = 150;
-const int deadzoneMin  = joyCenter - deadzoneSize;  // 362
-const int deadzoneMax  = joyCenter + deadzoneSize;  // 662
+int joy1XCenter = 512;
+int joy1YCenter = 512;
+int joy2XCenter = 512;
+int joy2YCenter = 512;
+
+// Wide deadzone — applied as offset from calibrated center
+const int deadzoneSize = 180;
 
 // ============================
 // MOVEMENT TIMING
-// Controls how fast servos move
-// Lower moveInterval = faster updates
-// Higher speed value = more degrees per update
 // ============================
 unsigned long lastMoveTime = 0;
-const unsigned long moveInterval = 20;  // milliseconds between updates
+const unsigned long moveInterval = 25;
 
-const int baseSpeed     = 2;  // degrees per update
+const int baseSpeed     = 1;  // base intentionally slow for stability
 const int shoulderSpeed = 1;
 const int elbowSpeed    = 1;
 const int gripperSpeed  = 2;
 
 // ============================
-// BUTTON STATE TRACKING
-// Tracks previous button state so we only
-// trigger once per press, not continuously
+// BUTTON STATE
 // ============================
 bool lastBtn1State = HIGH;
 bool lastBtn2State = HIGH;
@@ -97,39 +91,65 @@ unsigned long lastBtn1Press = 0;
 unsigned long lastBtn2Press = 0;
 const unsigned long debounceDelay = 250;
 
-// Prevents joystick input during animations
 bool animationPlaying = false;
 
 // ============================
+// CALIBRATE JOYSTICKS
+// Reads each joystick 30 times at startup (assumes hands off)
+// Averages the readings to find true resting position
+// This eliminates "false center" jitter
+// ============================
+void calibrateJoysticks() {
+  Serial.println("Calibrating joysticks - DO NOT TOUCH");
+  delay(500);
+  
+  long sum1X = 0, sum1Y = 0, sum2X = 0, sum2Y = 0;
+  
+  for (int i = 0; i < 30; i++) {
+    sum1X += analogRead(joy1XPin);
+    sum1Y += analogRead(joy1YPin);
+    sum2X += analogRead(joy2XPin);
+    sum2Y += analogRead(joy2YPin);
+    delay(10);
+  }
+  
+  joy1XCenter = sum1X / 30;
+  joy1YCenter = sum1Y / 30;
+  joy2XCenter = sum2X / 30;
+  joy2YCenter = sum2Y / 30;
+  
+  Serial.print("J1X center: "); Serial.println(joy1XCenter);
+  Serial.print("J1Y center: "); Serial.println(joy1YCenter);
+  Serial.print("J2X center: "); Serial.println(joy2XCenter);
+  Serial.print("J2Y center: "); Serial.println(joy2YCenter);
+}
+
+// ============================
 // READ JOYSTICK WITH AVERAGING
-// Takes 4 samples and averages them
-// Reduces electrical noise on analog pins
+// 8 samples for extra noise rejection (was 4)
 // ============================
 int readJoystick(int pin) {
   long sum = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 8; i++) {
     sum += analogRead(pin);
     delayMicroseconds(100);
   }
-  return sum / 4;
+  return sum / 8;
 }
 
 // ============================
 // JOYSTICK TO DIRECTION
-// Converts raw joystick value to movement intent
-// Returns: +1 (move one way), -1 (move other way), 0 (no move)
-// Inverted because joysticks are held upside down
+// Now uses calibrated center instead of assumed 512
+// Inverted (joystick held upside down)
 // ============================
-int joystickDir(int joyValue) {
-  if (joyValue < deadzoneMin) return +1;
-  if (joyValue > deadzoneMax) return -1;
+int joystickDir(int joyValue, int center) {
+  if (joyValue < center - deadzoneSize) return +1;
+  if (joyValue > center + deadzoneSize) return -1;
   return 0;
 }
 
 // ============================
 // SAFE SERVO WRITE
-// Only sends signal to servo if position actually changed
-// Eliminates constant PWM writes that cause buzzing
 // ============================
 void safeWrite(Servo &servo, int current, int &lastWritten) {
   if (current != lastWritten) {
@@ -139,9 +159,7 @@ void safeWrite(Servo &servo, int current, int &lastWritten) {
 }
 
 // ============================
-// SMOOTH SINGLE SERVO MOVE
-// Used inside animations
-// Moves one degree at a time with a delay between steps
+// SMOOTH MOVE (used in animations)
 // ============================
 void smoothMove(Servo &servo, int &current, int &lastWritten, int target, int stepDelay) {
   while (current != target) {
@@ -152,85 +170,58 @@ void smoothMove(Servo &servo, int &current, int &lastWritten, int target, int st
   }
 }
 
-// ============================
-// SETUP
-// Runs once on power up
-// ============================
 void setup() {
   Serial.begin(9600);
   
-  // INPUT_PULLUP means:
-  // unpressed button = HIGH (internal resistor pulls pin up)
-  // pressed button = LOW (button connects pin to ground)
   pinMode(btn1Pin, INPUT_PULLUP);
   pinMode(btn2Pin, INPUT_PULLUP);
   
-  // Attach and home servos one at a time
-  // Prevents all 4 drawing peak current simultaneously (brownout)
   Serial.println("Homing servos...");
   
   servoBase.attach(basePin);
   servoBase.write(restBase);
-  Serial.println("Base homed");
   delay(800);
   
   servoShoulder.attach(shoulderPin);
   servoShoulder.write(restShoulder);
-  Serial.println("Shoulder homed");
   delay(800);
   
   servoElbow.attach(elbowPin);
   servoElbow.write(restElbow);
-  Serial.println("Elbow homed");
   delay(800);
   
   servoGripper.attach(gripperPin);
   servoGripper.write(restGripper);
-  Serial.println("Gripper homed");
   delay(1000);
+  
+  // Calibrate joysticks AFTER servos are powered and stable
+  // Hands must be off the joysticks during this!
+  calibrateJoysticks();
   
   Serial.println();
   Serial.println("=== Robot Arm Ready ===");
-  Serial.println("J1 LR = Base rotation");
-  Serial.println("J1 UD = Shoulder");
-  Serial.println("J2 LR = Gripper");
-  Serial.println("J2 UD = Elbow");
-  Serial.println("Btn1  = Return to rest");
-  Serial.println("Btn2  = Wave emote");
-  Serial.println("=======================");
 }
 
-// ============================
-// MAIN LOOP
-// Runs continuously after setup
-// ============================
 void loop() {
-  // Skip joystick control if animation is running
   if (animationPlaying) return;
   
-  // Read all four joystick axes with noise averaging
-  int joy1X = readJoystick(joy1XPin);  // base
-  int joy1Y = readJoystick(joy1YPin);  // shoulder
-  int joy2X = readJoystick(joy2XPin);  // gripper
-  int joy2Y = readJoystick(joy2YPin);  // elbow
+  // Read all joysticks with averaging
+  int joy1X = readJoystick(joy1XPin);
+  int joy1Y = readJoystick(joy1YPin);
+  int joy2X = readJoystick(joy2XPin);
+  int joy2Y = readJoystick(joy2YPin);
   
-  // Convert readings to directional intent
-  // +1 = move toward max limit
-  // -1 = move toward min limit
-  //  0 = joystick in deadzone, no movement
-  int baseDir     = joystickDir(joy1X);
-  int shoulderDir = joystickDir(joy1Y);
-  int gripperDir  = joystickDir(joy2X);
-  int elbowDir    = joystickDir(joy2Y);
+  // Get directional intent using calibrated centers
+  int baseDir     = joystickDir(joy1X, joy1XCenter);
+  int shoulderDir = joystickDir(joy1Y, joy1YCenter);
+  int gripperDir  = joystickDir(joy2X, joy2XCenter);
+  int elbowDir    = joystickDir(joy2Y, joy2YCenter);
   
-  // Only update servo positions at fixed time intervals
-  // This makes movement speed consistent regardless of loop speed
+  // Time-gated movement updates
   unsigned long now = millis();
   if (now - lastMoveTime >= moveInterval) {
     lastMoveTime = now;
     
-    // Move each joint in its commanded direction
-    // constrain() keeps values within safe limits
     if (baseDir != 0)
       currentBase = constrain(currentBase + (baseDir * baseSpeed), baseMin, baseMax);
     
@@ -243,24 +234,16 @@ void loop() {
     if (gripperDir != 0)
       currentGripper = constrain(currentGripper + (gripperDir * gripperSpeed), gripperMin, gripperMax);
     
-    // Write new positions to servos
-    // safeWrite only sends signal if position actually changed
     safeWrite(servoBase,     currentBase,     lastWrittenBase);
     safeWrite(servoShoulder, currentShoulder, lastWrittenShoulder);
     safeWrite(servoElbow,    currentElbow,    lastWrittenElbow);
     safeWrite(servoGripper,  currentGripper,  lastWrittenGripper);
   }
   
-  // ============================
-  // BUTTON HANDLING
-  // Check for button presses
-  // Using edge detection: only trigger on transition
-  // from not-pressed (HIGH) to pressed (LOW)
-  // ============================
+  // Buttons
   bool btn1 = digitalRead(btn1Pin);
   bool btn2 = digitalRead(btn2Pin);
   
-  // Button 1: return to rest
   if (btn1 == LOW && lastBtn1State == HIGH) {
     if (millis() - lastBtn1Press > debounceDelay) {
       lastBtn1Press = millis();
@@ -270,7 +253,6 @@ void loop() {
   }
   lastBtn1State = btn1;
   
-  // Button 2: play wave emote
   if (btn2 == LOW && lastBtn2State == HIGH) {
     if (millis() - lastBtn2Press > debounceDelay) {
       lastBtn2Press = millis();
@@ -283,8 +265,6 @@ void loop() {
 
 // ============================
 // RETURN TO REST
-// Moves all joints simultaneously back to rest position
-// Runs until all joints reach their target
 // ============================
 void returnToRest() {
   animationPlaying = true;
@@ -314,56 +294,37 @@ void returnToRest() {
       moving = true;
     }
     
-    delay(18);
+    delay(20);
   }
   
-  Serial.println("At rest.");
   animationPlaying = false;
 }
 
 // ============================
 // WAVE EMOTE
-// Sequence:
-// 1. Raise shoulder and bend elbow up
-// 2. Open gripper
-// 3. Wave base left/right 3 times with gripper snapping open/closed
-// 4. Center base
-// 5. Elbow pump twice
-// 6. Close gripper
-// 7. Return to rest
 // ============================
 void playEmote() {
   animationPlaying = true;
   
-  // Phase 1: raise arm up
-  Serial.println("Emote phase 1: raising arm");
   smoothMove(servoShoulder, currentShoulder, lastWrittenShoulder, 130, 18);
   smoothMove(servoElbow,    currentElbow,    lastWrittenElbow,    60,  18);
   delay(300);
   
-  // Phase 2: open gripper
-  Serial.println("Emote phase 2: opening gripper");
   smoothMove(servoGripper, currentGripper, lastWrittenGripper, gripperMax, 15);
   delay(200);
   
-  // Phase 3: wave left/right 3 times
-  // Gripper snaps closed on left swing, open on right swing
-  Serial.println("Emote phase 3: waving");
   for (int i = 0; i < 3; i++) {
-    smoothMove(servoBase,    currentBase,    lastWrittenBase,    60,         10);
+    smoothMove(servoBase,    currentBase,    lastWrittenBase,    60, 10);
     smoothMove(servoGripper, currentGripper, lastWrittenGripper, gripperMin, 10);
     delay(80);
-    smoothMove(servoBase,    currentBase,    lastWrittenBase,    120,        10);
+    smoothMove(servoBase,    currentBase,    lastWrittenBase,    120, 10);
     smoothMove(servoGripper, currentGripper, lastWrittenGripper, gripperMax, 10);
     delay(80);
   }
   
-  // Phase 4: center base
   smoothMove(servoBase, currentBase, lastWrittenBase, 90, 15);
   delay(200);
   
-  // Phase 5: elbow pump twice
-  Serial.println("Emote phase 5: elbow pump");
   for (int i = 0; i < 2; i++) {
     smoothMove(servoElbow, currentElbow, lastWrittenElbow, 120, 10);
     delay(80);
@@ -371,14 +332,9 @@ void playEmote() {
     delay(80);
   }
   
-  // Phase 6: close gripper
   smoothMove(servoGripper, currentGripper, lastWrittenGripper, gripperMin, 15);
   delay(400);
   
-  // Phase 7: return to rest
-  Serial.println("Emote phase 7: returning to rest");
   animationPlaying = false;
   returnToRest();
-  
-  Serial.println("Emote complete.");
 }
